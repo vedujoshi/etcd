@@ -50,7 +50,9 @@ var (
 	seqKeys      bool
 
 	compactInterval   time.Duration
+        doRead bool
 	compactIndexDelta int64
+	keyPrefix string
 )
 
 func init() {
@@ -64,6 +66,8 @@ func init() {
 	putCmd.Flags().BoolVar(&seqKeys, "sequential-keys", false, "Use sequential keys")
 	putCmd.Flags().DurationVar(&compactInterval, "compact-interval", 0, `Interval to compact database (do not duplicate this with etcd's 'auto-compaction-retention' flag) (e.g. --compact-interval=5m compacts every 5-minute)`)
 	putCmd.Flags().Int64Var(&compactIndexDelta, "compact-index-delta", 1000, "Delta between current revision and compact revision (e.g. current revision 10000, compact at 9000)")
+	putCmd.Flags().BoolVar(&doRead, "do-read", false, "Do parallel reads continuously by a client")
+	putCmd.Flags().StringVar(&keyPrefix, "key-prefix", "", "Prefix to be added to each key")
 }
 
 func putFunc(cmd *cobra.Command, args []string) {
@@ -73,11 +77,16 @@ func putFunc(cmd *cobra.Command, args []string) {
 	}
 
 	requests := make(chan v3.Op, totalClients)
+        //readRequests := make(chan v3.Op, 1)
+	writeDone := make(chan int, 1)
 	if putRate == 0 {
 		putRate = math.MaxInt32
 	}
 	limit := rate.NewLimiter(rate.Limit(putRate), 1)
 	clients := mustCreateClients(totalClients, totalConns)
+	readClient := mustCreateClients(1, 1)[0]
+	fmt.Println(readClient)
+//	k, v := make([]byte, keySize), string(mustRandBytes(valSize))
 	k, v := make([]byte, keySize), string(mustRandBytes(valSize))
 
 	bar = pb.New(putTotal)
@@ -85,6 +94,30 @@ func putFunc(cmd *cobra.Command, args []string) {
 	bar.Start()
 
 	r := newReport()
+        // Do continuous reads until the writes are done
+	if doRead {
+		go func () {
+		    for {
+			//fmt.Println("Starting to read")
+			select {
+			case <-writeDone:
+				fmt.Println("Done writing")
+				defer wg.Done()
+				break
+			default:
+				read_op := v3.OpGet("\x00")
+				if _, err := readClient.Do(context.TODO(), read_op); err != nil {
+					fmt.Println(err)
+				} else {
+					fmt.Println("Did a get")
+				}
+
+			}
+		   }
+
+		}()
+	}
+
 	for i := range clients {
 		wg.Add(1)
 		go func(c *v3.Client) {
@@ -102,12 +135,18 @@ func putFunc(cmd *cobra.Command, args []string) {
 
 	go func() {
 		for i := 0; i < putTotal; i++ {
+			keyString := ""
 			if seqKeys {
 				binary.PutVarint(k, int64(i%keySpaceSize))
 			} else {
 				binary.PutVarint(k, int64(rand.Intn(keySpaceSize)))
 			}
-			requests <- v3.OpPut(string(k), v)
+                        if keyPrefix != "" {
+				keyString = keyPrefix + string(k)
+			} else {
+				keyString = string(k)
+			}
+			requests <- v3.OpPut(keyString, v)
 		}
 		close(requests)
 	}()
